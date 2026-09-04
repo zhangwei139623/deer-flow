@@ -13,7 +13,7 @@ from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from contextvars import Context, copy_context
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -60,6 +60,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _EXTENSION_TASK_NOTIFY_TIMEOUT_SECONDS = 3.0
+# Kept as wire keys here instead of importing ``deerflow.sandbox`` at module
+# load: executor tests and extension embedders replace that package while
+# breaking agent/tool import cycles.
+_SANDBOX_LEASE_OWNER_CONTEXT_KEY = "sandbox_lease_owner_id"
+_SANDBOX_COMMAND_SCOPE_CONTEXT_KEY = "sandbox_command_scope_id"
+
+
+def _utcnow() -> datetime:
+    # SubagentResult timestamp writers must stamp UTC-aware datetimes so
+    # lifecycle metadata never depends on the host wall clock (see deerflow.utils.time).
+    return datetime.now(UTC)
 
 
 _previous_shutdown_isolated_subagent_loop = globals().get("_shutdown_isolated_subagent_loop")
@@ -237,7 +248,7 @@ class SubagentResult:
             if tool_receipts is not None:
                 self.tool_receipts = [dict(receipt) for receipt in tool_receipts]
             self.admission_failure = admission_failure
-            self.completed_at = completed_at or datetime.now()
+            self.completed_at = completed_at or _utcnow()
             self.status = status
             return True
 
@@ -1276,7 +1287,7 @@ class SubagentExecutor:
                     with result._state_lock:
                         if not result.status.is_terminal:
                             result.status = SubagentStatus.RUNNING
-                            result.started_at = datetime.now()
+                            result.started_at = _utcnow()
                     return await self._aexecute_admitted(task, result)
             except SubagentCapacityError as exc:
                 result.try_set_terminal(
@@ -1306,8 +1317,10 @@ class SubagentExecutor:
                 task_id=task_id,
                 trace_id=self.trace_id,
                 status=SubagentStatus.RUNNING,
-                started_at=datetime.now(),
+                started_at=_utcnow(),
             )
+        sandbox_lease_owner_id = f"subagent:{result.task_id}"
+        execution_context: dict[str, Any] | None = None
         from deerflow_extension_api import ExtensionData, TaskInfo
 
         from deerflow.extensions import get_loaded_extensions
@@ -1465,6 +1478,9 @@ class SubagentExecutor:
             context["authz_attributes"] = dict(self.authz_attributes)
             context[DEERFLOW_TRACE_METADATA_KEY] = self.deerflow_trace_id
             context["is_subagent"] = True
+            context[_SANDBOX_LEASE_OWNER_CONTEXT_KEY] = sandbox_lease_owner_id
+            context[_SANDBOX_COMMAND_SCOPE_CONTEXT_KEY] = sandbox_lease_owner_id
+            execution_context = context
             context["agent_id"] = self.config.name
             if self.loop_detection_recorder is not None:
                 context[LOOP_DETECTION_RECORDER_CONTEXT_KEY] = self.loop_detection_recorder
@@ -1623,6 +1639,20 @@ class SubagentExecutor:
             )
 
         finally:
+            if execution_context is not None and execution_context.get("sandbox_id") is not None:
+                try:
+                    from deerflow.sandbox import get_sandbox_provider
+                    from deerflow.sandbox.lease import get_sandbox_lease_manager
+
+                    provider = get_sandbox_provider()
+                    await get_sandbox_lease_manager(provider).release_async(sandbox_lease_owner_id)
+                except Exception:
+                    logger.warning(
+                        "[trace=%s] Failed to release sandbox execution lease for subagent %s",
+                        self.trace_id,
+                        self.config.name,
+                        exc_info=True,
+                    )
             if task_info is not None and task_store is not None:
                 try:
                     await notify_task_stop(
